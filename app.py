@@ -2,34 +2,21 @@
 """
 app.py — OpenClaw + Ollama setup wizard (curses TUI)
 
-Fixes included vs previous version:
-1) If `pnpm openclaw gateway ...` exits non-zero, the wizard no longer crashes.
-   - It shows the last log lines and continues to the "Done" screen.
-   - If you press 'q' to stop the gateway, that's treated as a normal exit (not an error).
+Fix in this version:
+- Prevents `_curses.error: addwstr() returned ERR` by using safe screen writes that:
+  - never write past the last row/col
+  - truncate long strings
+  - gracefully clip overly-long dialogs (no crash)
 
-2) Safer clone/delete handling:
-   - If the chosen clone directory contains the running script OR is your current working directory,
-     the wizard will NOT offer "Delete & re-clone" (prevents cwd disappearing / apport issues).
-
-Other features:
-- Clones/updates https://github.com/openclaw/openclaw
-- Builds from source (pnpm install, pnpm ui:build, pnpm build)
+Other behavior (same as prior):
+- Clone/update OpenClaw
+- Build from source (pnpm install, pnpm ui:build, pnpm build)
 - Curses UI:
-  - Telegram bot token ingress (multi-account: channels.telegram.accounts)
-  - Arrow-key model picker from local Ollama (/api/tags), Enter to select, type-to-filter
-  - Optional: pull the selected model (ollama pull ...)
-- Writes:
-  - ~/.openclaw/.env          (OLLAMA_API_KEY=ollama-local for Ollama implicit discovery)
-  - ~/.openclaw/openclaw.json (sets primary model to ollama/<selected>, telegram config if provided)
-
-Controls:
-- Lists: ↑/↓ to move, Enter to select, Esc to go back, type to filter, Backspace to delete
-- Long-running steps: press 'q' to abort (gateway stop is treated as normal)
-
-Notes:
-- Requires: git, node (>=22), ollama
-- pnpm: if missing but corepack is present, wizard will attempt to enable/activate pnpm automatically.
-- Best on Linux/macOS terminals. Windows: run in WSL2.
+  - Telegram bot token ingress (multi-account)
+  - Arrow-key Ollama model picker from /api/tags (type-to-filter, Enter to select)
+  - Optional ollama pull
+- Writes ~/.openclaw/.env (OLLAMA_API_KEY=ollama-local) and ~/.openclaw/openclaw.json
+- Optional: start gateway (failure won’t crash wizard; stop with 'q' treated as normal)
 """
 
 from __future__ import annotations
@@ -68,7 +55,7 @@ def set_private_perms(p: Path) -> None:
     try:
         os.chmod(p, 0o600)
     except Exception:
-        pass  # best-effort on Windows/odd FS
+        pass
 
 def parse_node_major(version_str: str) -> Optional[int]:
     m = re.search(r"v?(\d+)\.", (version_str or "").strip())
@@ -93,7 +80,6 @@ def safe_rmtree(p: Path) -> None:
     shutil.rmtree(p)
 
 def is_within(child: Path, parent: Path) -> bool:
-    """True if child path is inside parent (or equals parent)."""
     try:
         child.resolve().relative_to(parent.resolve())
         return True
@@ -101,7 +87,6 @@ def is_within(child: Path, parent: Path) -> bool:
         return False
 
 def port_is_free(host: str, port: int) -> bool:
-    """Best-effort local bind test for port availability."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -109,6 +94,51 @@ def port_is_free(host: str, port: int) -> bool:
         return True
     except OSError:
         return False
+
+
+# -------------------------
+# SAFE CURSES WRITES (prevents addwstr ERR)
+# -------------------------
+
+def safe_addstr(win, y: int, x: int, s: str, attr: int = 0) -> None:
+    """
+    Safely write text inside window bounds.
+    - Clips to last column (avoids lower-right corner issues)
+    - Ignores attempts to write off-screen
+    """
+    try:
+        maxy, maxx = win.getmaxyx()
+        if y < 0 or y >= maxy:
+            return
+        if x < 0 or x >= maxx:
+            return
+        max_len = maxx - x - 1  # avoid last column edge cases
+        if max_len <= 0:
+            return
+        ss = s[:max_len]
+        try:
+            if attr:
+                win.addstr(y, x, ss, attr)
+            else:
+                win.addstr(y, x, ss)
+        except curses.error:
+            # best-effort; ignore rendering errors
+            return
+    except Exception:
+        return
+
+def safe_hline(win, y: int, x: int, ch: str, n: int, attr: int = 0) -> None:
+    try:
+        maxy, maxx = win.getmaxyx()
+        if y < 0 or y >= maxy or x < 0 or x >= maxx:
+            return
+        n = min(n, maxx - x - 1)
+        if n <= 0:
+            return
+        s = ch * n
+        safe_addstr(win, y, x, s, attr)
+    except Exception:
+        return
 
 
 # -------------------------
@@ -161,7 +191,6 @@ def build_model_menu_items(base: str, names: List[str]) -> List[Tuple[str, str]]
             flags.append("thinking")
         tag = f" [{' '.join(flags)}]" if flags else ""
         out.append((f"{n}{tag}", n))
-    # Prefer tool-capable first
     out.sort(key=lambda lv: (0 if "tools" in lv[0] else 1, lv[0].lower()))
     return out
 
@@ -171,7 +200,6 @@ def build_model_menu_items(base: str, names: List[str]) -> List[Tuple[str, str]]
 # -------------------------
 
 def update_dotenv(path: Path, kv: Dict[str, str]) -> None:
-    """Upsert keys into a dotenv file without clobbering unrelated keys."""
     lines: List[str] = []
     if path.exists():
         try:
@@ -220,40 +248,68 @@ class LogBuffer:
             self.lines = self.lines[-self.max_lines:]
 
     def tail(self, n: int = 40) -> str:
-        view = self.lines[-n:]
-        return "\n".join(view).strip()
+        return "\n".join(self.lines[-n:]).strip()
 
 
 def ui_header(stdscr, title: str, subtitle: str = "") -> None:
     h, w = stdscr.getmaxyx()
     stdscr.attron(curses.A_REVERSE)
-    stdscr.addstr(0, 0, " " * (w - 1))
-    stdscr.addstr(0, 1, title[: w - 3], curses.A_BOLD)
+    safe_hline(stdscr, 0, 0, " ", w, 0)
+    safe_addstr(stdscr, 0, 1, title[: max(0, w - 3)], curses.A_BOLD)
     stdscr.attroff(curses.A_REVERSE)
     if subtitle:
-        stdscr.addstr(1, 1, subtitle[: w - 3])
+        safe_addstr(stdscr, 1, 1, subtitle[: max(0, w - 3)], 0)
 
 def ui_footer(stdscr, text: str) -> None:
     h, w = stdscr.getmaxyx()
     stdscr.attron(curses.A_REVERSE)
-    stdscr.addstr(h - 1, 0, " " * (w - 1))
-    stdscr.addstr(h - 1, 1, text[: w - 3])
+    safe_hline(stdscr, h - 1, 0, " ", w, 0)
+    safe_addstr(stdscr, h - 1, 1, text[: max(0, w - 3)], 0)
     stdscr.attroff(curses.A_REVERSE)
 
 def ui_paragraph(stdscr, y: int, x: int, w: int, text: str) -> int:
-    wrapped = textwrap.wrap(text, width=max(10, w))
+    """
+    Writes wrapped text starting at (y,x), clipped to visible area.
+    Returns the next y after what was written (clipped to screen).
+    """
+    maxy, maxx = stdscr.getmaxyx()
+    usable_w = min(w, max(10, maxx - x - 2))
+    if usable_w < 10:
+        return min(y, maxy - 2)
+
+    wrapped = textwrap.wrap(text, width=usable_w)
+    written = 0
     for i, line in enumerate(wrapped):
-        stdscr.addstr(y + i, x, line)
-    return y + len(wrapped)
+        yy = y + i
+        if yy >= maxy - 1:  # keep footer row free
+            break
+        safe_addstr(stdscr, yy, x, line, 0)
+        written += 1
+    return min(y + written, maxy - 2)
 
 def message_box(stdscr, title: str, text: str, footer: str = "Press any key") -> None:
     stdscr.clear()
     ui_header(stdscr, title)
     h, w = stdscr.getmaxyx()
     y = 3
+    truncated = False
+
     for para in text.split("\n"):
-        y = ui_paragraph(stdscr, y, 2, w - 4, para)
-        y += 1
+        if y >= h - 2:
+            truncated = True
+            break
+        y2 = ui_paragraph(stdscr, y, 2, w - 4, para)
+        if y2 == y and para:
+            # couldn't write anything (tiny terminal)
+            truncated = True
+            break
+        y = y2
+        if y < h - 2:
+            y += 1
+
+    if truncated:
+        footer = (footer + " (truncated; resize terminal for more)")[: max(0, w - 3)]
+
     ui_footer(stdscr, footer)
     stdscr.refresh()
     stdscr.getch()
@@ -264,14 +320,14 @@ def yes_no(stdscr, title: str, question: str, default_yes: bool = True) -> bool:
     h, w = stdscr.getmaxyx()
     y = 3
     y = ui_paragraph(stdscr, y, 2, w - 4, question)
-    y += 2
+    y = min(y + 2, h - 3)
 
     choice = 0 if default_yes else 1
     options = ["Yes", "No"]
     while True:
         for i, opt in enumerate(options):
             attr = curses.A_REVERSE if i == choice else curses.A_NORMAL
-            stdscr.addstr(y, 2 + i * 8, opt, attr)
+            safe_addstr(stdscr, y, 2 + i * 8, opt, attr)
         ui_footer(stdscr, "←/→ or y/n   Enter=Select")
         stdscr.refresh()
         ch = stdscr.getch()
@@ -293,22 +349,27 @@ def prompt_text(stdscr, title: str, prompt: str, initial: str = "", secret: bool
     h, w = stdscr.getmaxyx()
     y = 3
     y = ui_paragraph(stdscr, y, 2, w - 4, prompt)
-    y += 1
+    y = min(y + 1, h - 3)
 
     buf = list(initial)
     while True:
-        stdscr.addstr(y, 2, " " * (w - 4))
+        # clear input line
+        safe_hline(stdscr, y, 2, " ", w - 4, 0)
         shown = ("*" * len(buf)) if secret else "".join(buf)
-        stdscr.addstr(y, 2, shown[: w - 4])
-        stdscr.move(y, 2 + min(len(shown), w - 5))
+        safe_addstr(stdscr, y, 2, shown, 0)
+        try:
+            stdscr.move(y, 2 + min(len(shown), max(0, w - 5)))
+        except curses.error:
+            pass
+
         ui_footer(stdscr, "Enter=OK  Esc=Cancel  Backspace=Delete")
         stdscr.refresh()
 
         ch = stdscr.getch()
-        if ch == 27:  # ESC
+        if ch == 27:
             curses.curs_set(0)
             return None
-        if ch in (10, 13):  # Enter
+        if ch in (10, 13):
             curses.curs_set(0)
             return "".join(buf).strip()
         if ch in (curses.KEY_BACKSPACE, 127, 8):
@@ -335,7 +396,7 @@ def select_list(
         ui_header(stdscr, title, subtitle)
         h, w = stdscr.getmaxyx()
         list_y = 3
-        list_h = h - 5
+        list_h = max(1, h - 5)
 
         flt = [(l, v) for (l, v) in items if filter_text.lower() in l.lower()] if filter_text else items[:]
 
@@ -355,7 +416,7 @@ def select_list(
                     break
                 label, _val = flt[j]
                 attr = curses.A_REVERSE if j == idx else curses.A_NORMAL
-                stdscr.addstr(list_y + row, 2, label[: w - 4], attr)
+                safe_addstr(stdscr, list_y + row, 2, label[: max(0, w - 4)], attr)
 
         parts = []
         if allow_filter:
@@ -363,9 +424,9 @@ def select_list(
         parts.append("↑↓=Move  Enter=Select  Esc=Back")
         if allow_custom:
             parts.append("c=Custom")
-        ui_footer(stdscr, "   |   ".join(parts)[: w - 3])
-        stdscr.refresh()
+        ui_footer(stdscr, "   |   ".join(parts))
 
+        stdscr.refresh()
         ch = stdscr.getch()
         if ch == 27:
             return None
@@ -391,10 +452,6 @@ def select_list(
 
 
 def manage_telegram_accounts(stdscr) -> Dict[str, Dict[str, str]]:
-    """
-    Returns mapping:
-      { "default": {"name": "...", "botToken": "..."}, ... }
-    """
     accounts: Dict[str, Dict[str, str]] = {"default": {"name": "Primary bot", "botToken": ""}}
     idx = 0
 
@@ -408,25 +465,24 @@ def manage_telegram_accounts(stdscr) -> Dict[str, Dict[str, str]]:
             idx = clamp(idx, 0, len(keys) - 1)
 
         y = 3
-        stdscr.addstr(y, 2, "Accounts:", curses.A_BOLD)
+        safe_addstr(stdscr, y, 2, "Accounts:", curses.A_BOLD)
         y += 1
 
-        max_rows = h - 8
+        max_rows = max(1, h - 8)
         for i, k in enumerate(keys[:max_rows]):
             a = accounts[k]
             label = f"{k:12}  {a.get('name','')[:24]:24}  token={'set' if a.get('botToken') else 'EMPTY'}"
             attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
-            stdscr.addstr(y + i, 2, label[: w - 4], attr)
+            safe_addstr(stdscr, y + i, 2, label[: max(0, w - 4)], attr)
 
         ui_footer(stdscr, "a=Add  e=Edit  d=Delete  ↑↓=Move  Enter=Done  Esc=Cancel")
         stdscr.refresh()
 
         ch = stdscr.getch()
-        if ch == 27:  # cancel
+        if ch == 27:
             return {}
-        if ch in (10, 13):  # done
-            cleaned = {k: v for k, v in accounts.items() if v.get("botToken")}
-            return cleaned
+        if ch in (10, 13):
+            return {k: v for k, v in accounts.items() if v.get("botToken")}
         if ch in (curses.KEY_UP, ord("k")):
             idx = max(0, idx - 1)
         elif ch in (curses.KEY_DOWN, ord("j")):
@@ -469,7 +525,6 @@ def manage_telegram_accounts(stdscr) -> Dict[str, Dict[str, str]]:
 @dataclass
 class SetupState:
     repo_url: str = "https://github.com/openclaw/openclaw.git"
-    # safer default than ~/openclaw because many people run app.py from ~/openclaw
     clone_dir: Path = field(default_factory=lambda: expand_path("~/src/openclaw"))
     state_dir: Path = field(default_factory=lambda: expand_path("~/.openclaw"))
     config_path: Path = field(default_factory=lambda: expand_path("~/.openclaw/openclaw.json"))
@@ -551,13 +606,6 @@ def run_cmd_live(
     check: bool = True,
     abort_is_error: bool = True,
 ) -> int:
-    """
-    Runs a command and streams output into the curses log view.
-
-    - Press 'q' to abort.
-    - If `check=True`, nonzero exit raises RuntimeError.
-    - If `abort_is_error=False`, abort returns 130 (instead of raising).
-    """
     base_env = os.environ.copy()
     if env:
         base_env.update(env)
@@ -586,10 +634,10 @@ def run_cmd_live(
         h, w = stdscr.getmaxyx()
         top = 3
         bottom = h - 2
-        height = bottom - top
+        height = max(1, bottom - top)
         view = log.lines[-height:]
         for i, line in enumerate(view):
-            stdscr.addstr(top + i, 1, line[: w - 2])
+            safe_addstr(stdscr, top + i, 1, line, 0)
         ui_footer(stdscr, "q=Abort   (output is live)")
         stdscr.refresh()
 
@@ -625,19 +673,10 @@ def run_cmd_live(
 
 
 # -------------------------
-# Git clone/update (safer + fixed for exit 128 cases)
+# Git clone/update
 # -------------------------
 
 def git_clone_or_update(stdscr, log: LogBuffer, state: SetupState, script_path: Path, start_cwd: Path) -> None:
-    """
-    Handles:
-    - existing git repo -> fetch/pull
-    - existing empty dir -> clone into '.' (works even if dir exists)
-    - existing non-empty non-git dir -> prompt: choose new dir, abort
-      (delete option is only offered if it's safe)
-    - non-existing dir -> normal clone
-    """
-    # Case A: Existing git repo -> update
     if state.clone_dir.exists() and dir_has_git(state.clone_dir):
         run_cmd_live(stdscr, log, ["git", "fetch", "--all", "--prune"], cwd=state.clone_dir, title="Updating repo (git fetch)")
         run_cmd_live(stdscr, log, ["git", "checkout", "main"], cwd=state.clone_dir, title="Updating repo (git checkout main)")
@@ -646,16 +685,9 @@ def git_clone_or_update(stdscr, log: LogBuffer, state: SetupState, script_path: 
 
     unsafe_to_delete = is_within(start_cwd, state.clone_dir) or is_within(script_path, state.clone_dir)
 
-    # Case B: Directory exists but is NOT a git repo
     if state.clone_dir.exists():
         if dir_is_empty(state.clone_dir):
-            run_cmd_live(
-                stdscr,
-                log,
-                ["git", "clone", state.repo_url, "."],
-                cwd=state.clone_dir,
-                title="Cloning into existing empty directory",
-            )
+            run_cmd_live(stdscr, log, ["git", "clone", state.repo_url, "."], cwd=state.clone_dir, title="Cloning into existing empty directory")
             return
 
         menu: List[Tuple[str, str]] = []
@@ -666,7 +698,7 @@ def git_clone_or_update(stdscr, log: LogBuffer, state: SetupState, script_path: 
 
         subtitle = "The selected directory exists and is not a git repo."
         if unsafe_to_delete:
-            subtitle += " (Delete disabled: this directory contains your running script or current shell cwd.)"
+            subtitle += " (Delete disabled: directory contains your running script or current cwd.)"
 
         choice = select_list(
             stdscr,
@@ -678,23 +710,12 @@ def git_clone_or_update(stdscr, log: LogBuffer, state: SetupState, script_path: 
         )
 
         if choice == "delete":
-            ok = yes_no(
-                stdscr,
-                "Confirm delete",
-                f"Really delete this folder and ALL contents?\n\n{state.clone_dir}",
-                default_yes=False,
-            )
+            ok = yes_no(stdscr, "Confirm delete", f"Really delete this folder and ALL contents?\n\n{state.clone_dir}", default_yes=False)
             if not ok:
                 raise SystemExit(0)
             safe_rmtree(state.clone_dir)
             safe_mkdir(state.clone_dir.parent)
-            run_cmd_live(
-                stdscr,
-                log,
-                ["git", "clone", state.repo_url, str(state.clone_dir)],
-                cwd=state.clone_dir.parent,
-                title="Cloning OpenClaw",
-            )
+            run_cmd_live(stdscr, log, ["git", "clone", state.repo_url, str(state.clone_dir)], cwd=state.clone_dir.parent, title="Cloning OpenClaw")
             return
 
         if choice == "choose":
@@ -711,15 +732,8 @@ def git_clone_or_update(stdscr, log: LogBuffer, state: SetupState, script_path: 
 
         raise SystemExit(0)
 
-    # Case C: Directory doesn't exist -> normal clone
     safe_mkdir(state.clone_dir.parent)
-    run_cmd_live(
-        stdscr,
-        log,
-        ["git", "clone", state.repo_url, str(state.clone_dir)],
-        cwd=state.clone_dir.parent,
-        title="Cloning OpenClaw",
-    )
+    run_cmd_live(stdscr, log, ["git", "clone", state.repo_url, str(state.clone_dir)], cwd=state.clone_dir.parent, title="Cloning OpenClaw")
 
 
 # -------------------------
@@ -754,12 +768,8 @@ def write_openclaw_files(state: SetupState) -> None:
 
     cfg: dict = {
         "agents": {
-            "defaults": {
-                "model": {"primary": f"ollama/{state.ollama_model}"}
-            },
-            "list": [
-                {"id": "main", "default": True, "workspace": str(state.workspace_dir)}
-            ],
+            "defaults": {"model": {"primary": f"ollama/{state.ollama_model}"}},
+            "list": [{"id": "main", "default": True, "workspace": str(state.workspace_dir)}],
         }
     }
 
@@ -879,16 +889,9 @@ def pick_ollama_model(stdscr, state: SetupState) -> None:
 def pick_gateway_port_if_needed(stdscr, state: SetupState) -> None:
     if not state.start_gateway:
         return
-    # keep it simple: only validate once here; if busy, prompt another port
     while True:
-        p = prompt_text(
-            stdscr,
-            "Gateway port",
-            "Enter the port to run the OpenClaw gateway on:",
-            initial=str(state.gateway_port),
-        )
+        p = prompt_text(stdscr, "Gateway port", "Enter the port to run the OpenClaw gateway on:", initial=str(state.gateway_port))
         if p is None:
-            # user cancelled this prompt -> don't start gateway
             state.start_gateway = False
             return
         try:
@@ -899,13 +902,8 @@ def pick_gateway_port_if_needed(stdscr, state: SetupState) -> None:
             message_box(stdscr, "Invalid port", "Please enter a number between 1 and 65535.")
             continue
 
-        # quick local check (best-effort)
         if not port_is_free("127.0.0.1", port):
-            message_box(
-                stdscr,
-                "Port in use",
-                f"Port {port} appears to be in use on 127.0.0.1.\n\nPick a different port.",
-            )
+            message_box(stdscr, "Port in use", f"Port {port} appears to be in use on 127.0.0.1.\n\nPick a different port.")
             continue
 
         state.gateway_port = port
@@ -942,7 +940,6 @@ def maybe_start_gateway(stdscr, log: LogBuffer, state: SetupState, env: Dict[str
     if not state.start_gateway:
         return
 
-    # If it fails, do NOT crash the wizard—show tail and continue.
     cmd = ["pnpm", "openclaw", "gateway", "--port", str(state.gateway_port), "--verbose"]
     try:
         rc = run_cmd_live(
@@ -953,7 +950,7 @@ def maybe_start_gateway(stdscr, log: LogBuffer, state: SetupState, env: Dict[str
             env=env,
             title=f"Gateway running on port {state.gateway_port} (press q to stop)",
             check=False,
-            abort_is_error=False,  # stopping the gateway is normal
+            abort_is_error=False,
         )
         if rc not in (0, 130):
             message_box(
@@ -962,11 +959,7 @@ def maybe_start_gateway(stdscr, log: LogBuffer, state: SetupState, env: Dict[str
                 "The gateway exited with a non-zero status.\n\n"
                 "Last output:\n\n"
                 f"{log.tail(60)}\n\n"
-                "Common causes:\n"
-                "- Port already in use\n"
-                "- Missing/invalid config\n"
-                "- Node runtime error\n\n"
-                "You can try starting it manually:\n"
+                "Try starting it manually to see full error output:\n"
                 f"  cd {state.clone_dir}\n"
                 f"  {' '.join(cmd)}\n",
                 footer="Press any key to continue",
@@ -976,7 +969,7 @@ def maybe_start_gateway(stdscr, log: LogBuffer, state: SetupState, env: Dict[str
             stdscr,
             "Gateway failed to start",
             f"{e}\n\nLast output:\n\n{log.tail(60)}\n\n"
-            "You can try starting it manually from another terminal:\n"
+            "Try starting it manually:\n"
             f"  cd {state.clone_dir}\n"
             f"  {' '.join(cmd)}\n",
             footer="Press any key to continue",
@@ -984,7 +977,7 @@ def maybe_start_gateway(stdscr, log: LogBuffer, state: SetupState, env: Dict[str
 
 
 # -------------------------
-# Run all steps (no traceback spam)
+# Run all steps
 # -------------------------
 
 def run_all_steps(stdscr, state: SetupState, script_path: Path, start_cwd: Path) -> None:
@@ -1012,12 +1005,7 @@ def run_all_steps(stdscr, state: SetupState, script_path: Path, start_cwd: Path)
     except SystemExit:
         raise
     except Exception as e:
-        message_box(
-            stdscr,
-            "Setup failed",
-            f"{e}\n\nLast output:\n\n{log.tail(80)}",
-            footer="Press any key to exit",
-        )
+        message_box(stdscr, "Setup failed", f"{e}\n\nLast output:\n\n{log.tail(80)}", footer="Press any key to exit")
         raise SystemExit(1)
 
     message_box(
