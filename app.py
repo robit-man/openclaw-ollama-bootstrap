@@ -1,22 +1,40 @@
 #!/usr/bin/env python3
 """
-app.py — OpenClaw + Ollama setup wizard (curses TUI)
+OpenClaw + Ollama bootstrap wizard (curses TUI)
 
-Fix in this version:
-- Prevents `_curses.error: addwstr() returned ERR` by using safe screen writes that:
-  - never write past the last row/col
-  - truncate long strings
-  - gracefully clip overly-long dialogs (no crash)
+What this script does (end-to-end):
+- Clones/updates https://github.com/openclaw/openclaw
+- Ensures pnpm via corepack (non-interactive download prompt disabled)
+- Builds OpenClaw (pnpm install, pnpm ui:build, pnpm build)
+- Ollama integration:
+  - Lists local models via Ollama /api/tags
+  - Arrow-key picker + type-to-filter + Enter to select
+  - Optional: ollama pull selected model
+- Telegram integration:
+  - Key ingress for bot tokens (multi-account)
+- Gateway bootstrap:
+  - Writes gateway.mode=local
+  - Writes gateway.auth.token (the key you must pass to UI/curl)
+  - Optionally writes gateway.trustedProxies for Cloudflare Tunnel / reverse proxy
+  - Starts gateway with the known-good command:
+      pnpm openclaw gateway --port 18789 --verbose --allow-unconfigured --token "<token>"
+- Writes:
+  - ~/.openclaw/openclaw.json
+  - ~/.openclaw/.env
+- Shows:
+  - Token value
+  - Tokenized dashboard URLs
+  - Curl examples (with Authorization header)
 
-Other behavior (same as prior):
-- Clone/update OpenClaw
-- Build from source (pnpm install, pnpm ui:build, pnpm build)
-- Curses UI:
-  - Telegram bot token ingress (multi-account)
-  - Arrow-key Ollama model picker from /api/tags (type-to-filter, Enter to select)
-  - Optional ollama pull
-- Writes ~/.openclaw/.env (OLLAMA_API_KEY=ollama-local) and ~/.openclaw/openclaw.json
-- Optional: start gateway (failure won’t crash wizard; stop with 'q' treated as normal)
+Controls:
+- Lists: ↑/↓ move, Enter select, Esc back, type to filter, Backspace delete, c = custom
+- During long-running commands: 'q' abort (for gateway, 'q' stops it normally)
+
+Requires:
+- git
+- node >= 22
+- ollama
+- pnpm OR corepack (corepack usually bundled with node)
 """
 
 from __future__ import annotations
@@ -32,10 +50,12 @@ import subprocess
 import sys
 import textwrap
 import time
+import secrets
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 
 # -------------------------
@@ -97,22 +117,17 @@ def port_is_free(host: str, port: int) -> bool:
 
 
 # -------------------------
-# SAFE CURSES WRITES (prevents addwstr ERR)
+# SAFE CURSES WRITES (avoid addwstr ERR)
 # -------------------------
 
 def safe_addstr(win, y: int, x: int, s: str, attr: int = 0) -> None:
-    """
-    Safely write text inside window bounds.
-    - Clips to last column (avoids lower-right corner issues)
-    - Ignores attempts to write off-screen
-    """
     try:
         maxy, maxx = win.getmaxyx()
         if y < 0 or y >= maxy:
             return
         if x < 0 or x >= maxx:
             return
-        max_len = maxx - x - 1  # avoid last column edge cases
+        max_len = maxx - x - 1  # avoid last-col edge cases
         if max_len <= 0:
             return
         ss = s[:max_len]
@@ -122,7 +137,6 @@ def safe_addstr(win, y: int, x: int, s: str, attr: int = 0) -> None:
             else:
                 win.addstr(y, x, ss)
         except curses.error:
-            # best-effort; ignore rendering errors
             return
     except Exception:
         return
@@ -135,8 +149,7 @@ def safe_hline(win, y: int, x: int, ch: str, n: int, attr: int = 0) -> None:
         n = min(n, maxx - x - 1)
         if n <= 0:
             return
-        s = ch * n
-        safe_addstr(win, y, x, s, attr)
+        safe_addstr(win, y, x, ch * n, attr)
     except Exception:
         return
 
@@ -187,8 +200,6 @@ def build_model_menu_items(base: str, names: List[str]) -> List[Tuple[str, str]]
         flags: List[str] = []
         if is_tool_capable(caps):
             flags.append("tools")
-        if any(c.lower() == "thinking" for c in caps):
-            flags.append("thinking")
         tag = f" [{' '.join(flags)}]" if flags else ""
         out.append((f"{n}{tag}", n))
     out.sort(key=lambda lv: (0 if "tools" in lv[0] else 1, lv[0].lower()))
@@ -196,7 +207,7 @@ def build_model_menu_items(base: str, names: List[str]) -> List[Tuple[str, str]]
 
 
 # -------------------------
-# Dotenv + config writers
+# Files: dotenv + config
 # -------------------------
 
 def update_dotenv(path: Path, kv: Dict[str, str]) -> None:
@@ -225,6 +236,22 @@ def update_dotenv(path: Path, kv: Dict[str, str]) -> None:
     path.write_text("\n".join(out_lines).rstrip() + "\n", encoding="utf-8")
     set_private_perms(path)
 
+def read_json_if_exists(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def deep_merge(dst: dict, src: dict) -> dict:
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
+
 def write_json_config(path: Path, obj: dict) -> None:
     safe_mkdir(path.parent)
     path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
@@ -232,7 +259,7 @@ def write_json_config(path: Path, obj: dict) -> None:
 
 
 # -------------------------
-# Curses UI
+# Curses UI primitives
 # -------------------------
 
 class LogBuffer:
@@ -247,7 +274,7 @@ class LogBuffer:
         if len(self.lines) > self.max_lines:
             self.lines = self.lines[-self.max_lines:]
 
-    def tail(self, n: int = 40) -> str:
+    def tail(self, n: int = 60) -> str:
         return "\n".join(self.lines[-n:]).strip()
 
 
@@ -268,10 +295,6 @@ def ui_footer(stdscr, text: str) -> None:
     stdscr.attroff(curses.A_REVERSE)
 
 def ui_paragraph(stdscr, y: int, x: int, w: int, text: str) -> int:
-    """
-    Writes wrapped text starting at (y,x), clipped to visible area.
-    Returns the next y after what was written (clipped to screen).
-    """
     maxy, maxx = stdscr.getmaxyx()
     usable_w = min(w, max(10, maxx - x - 2))
     if usable_w < 10:
@@ -281,7 +304,7 @@ def ui_paragraph(stdscr, y: int, x: int, w: int, text: str) -> int:
     written = 0
     for i, line in enumerate(wrapped):
         yy = y + i
-        if yy >= maxy - 1:  # keep footer row free
+        if yy >= maxy - 1:
             break
         safe_addstr(stdscr, yy, x, line, 0)
         written += 1
@@ -300,7 +323,6 @@ def message_box(stdscr, title: str, text: str, footer: str = "Press any key") ->
             break
         y2 = ui_paragraph(stdscr, y, 2, w - 4, para)
         if y2 == y and para:
-            # couldn't write anything (tiny terminal)
             truncated = True
             break
         y = y2
@@ -353,7 +375,6 @@ def prompt_text(stdscr, title: str, prompt: str, initial: str = "", secret: bool
 
     buf = list(initial)
     while True:
-        # clear input line
         safe_hline(stdscr, y, 2, " ", w - 4, 0)
         shown = ("*" * len(buf)) if secret else "".join(buf)
         safe_addstr(stdscr, y, 2, shown, 0)
@@ -519,26 +540,42 @@ def manage_telegram_accounts(stdscr) -> Dict[str, Dict[str, str]]:
 
 
 # -------------------------
-# Setup state + dependency checks
+# Setup state
 # -------------------------
 
 @dataclass
 class SetupState:
     repo_url: str = "https://github.com/openclaw/openclaw.git"
     clone_dir: Path = field(default_factory=lambda: expand_path("~/src/openclaw"))
+
     state_dir: Path = field(default_factory=lambda: expand_path("~/.openclaw"))
     config_path: Path = field(default_factory=lambda: expand_path("~/.openclaw/openclaw.json"))
     dotenv_path: Path = field(default_factory=lambda: expand_path("~/.openclaw/.env"))
     workspace_dir: Path = field(default_factory=lambda: expand_path("~/.openclaw/workspace"))
+
     ollama_base: str = "http://127.0.0.1:11434"
     ollama_model: str = ""
     pull_model: bool = True
-    telegram_enabled: bool = False
-    telegram_dm_policy: str = "pairing"  # pairing | allowlist | open | disabled
-    telegram_accounts: Dict[str, Dict[str, str]] = field(default_factory=dict)
-    start_gateway: bool = False
-    gateway_port: int = 18789
 
+    telegram_enabled: bool = False
+    telegram_dm_policy: str = "pairing"
+    telegram_accounts: Dict[str, Dict[str, str]] = field(default_factory=dict)
+
+    gateway_port: int = 18789
+    gateway_token: str = ""  # required
+    start_gateway: bool = True
+
+    # Reverse proxy / tunnel support (Cloudflare Tunnel, nginx, caddy, etc.)
+    behind_proxy: bool = False
+    trusted_proxies: List[str] = field(default_factory=list)
+
+    # Optional: if you have a public URL (e.g. https://xxxxx.trycloudflare.com)
+    public_dashboard_url: str = ""
+
+
+# -------------------------
+# Dependency checks
+# -------------------------
 
 def ensure_node_ok() -> Tuple[bool, str]:
     if not which("node"):
@@ -549,27 +586,19 @@ def ensure_node_ok() -> Tuple[bool, str]:
         return False, f"Node too old: {p.stdout.strip()} (need >= 22)"
     return True, ""
 
-def ensure_pnpm_available() -> Tuple[bool, str]:
-    if which("pnpm"):
-        return True, ""
-    if which("corepack"):
-        return True, "pnpm not found, but corepack is present (will try to activate pnpm automatically)"
-    return False, "Missing: pnpm (install pnpm, or install a Node distro with corepack)"
-
 def dependency_screen(stdscr) -> None:
     issues: List[str] = []
-    notes: List[str] = []
 
     if not which("git"):
         issues.append("Missing: git")
+
     ok_node, msg_node = ensure_node_ok()
     if not ok_node:
         issues.append(msg_node)
-    ok_pnpm, msg_pnpm = ensure_pnpm_available()
-    if not ok_pnpm:
-        issues.append(msg_pnpm)
-    elif msg_pnpm:
-        notes.append(msg_pnpm)
+
+    if not (which("pnpm") or which("corepack")):
+        issues.append("Missing: pnpm OR corepack (corepack is usually bundled with node)")
+
     if not which("ollama"):
         issues.append("Missing: ollama CLI (needed for ollama pull/list)")
 
@@ -585,10 +614,7 @@ def dependency_screen(stdscr) -> None:
         message_box(stdscr, "Dependency check failed", msg, footer="Press any key to exit")
         raise SystemExit(1)
 
-    ok_msg = "All required commands were found (git, node>=22, ollama)."
-    if notes:
-        ok_msg += "\n\nNotes:\n" + "\n".join(f"- {n}" for n in notes)
-    message_box(stdscr, "Dependency check", ok_msg, footer="Press any key to continue")
+    message_box(stdscr, "Dependency check", "All required commands were found (git, node>=22, and ollama; pnpm or corepack present).", footer="Press any key to continue")
 
 
 # -------------------------
@@ -700,14 +726,7 @@ def git_clone_or_update(stdscr, log: LogBuffer, state: SetupState, script_path: 
         if unsafe_to_delete:
             subtitle += " (Delete disabled: directory contains your running script or current cwd.)"
 
-        choice = select_list(
-            stdscr,
-            "Clone directory is not empty",
-            menu,
-            subtitle=subtitle,
-            allow_filter=False,
-            allow_custom=False,
-        )
+        choice = select_list(stdscr, "Clone directory is not empty", menu, subtitle=subtitle, allow_filter=False, allow_custom=False)
 
         if choice == "delete":
             ok = yes_no(stdscr, "Confirm delete", f"Really delete this folder and ALL contents?\n\n{state.clone_dir}", default_yes=False)
@@ -719,12 +738,7 @@ def git_clone_or_update(stdscr, log: LogBuffer, state: SetupState, script_path: 
             return
 
         if choice == "choose":
-            newp = prompt_text(
-                stdscr,
-                "Choose clone directory",
-                "Enter a new clone directory path (it should not exist, or should be empty):",
-                initial=str(state.clone_dir.parent / "openclaw"),
-            )
+            newp = prompt_text(stdscr, "Choose clone directory", "Enter a new clone directory path (it should not exist, or should be empty):", initial=str(state.clone_dir.parent / "openclaw"))
             if not newp:
                 raise SystemExit(0)
             state.clone_dir = expand_path(newp)
@@ -737,24 +751,38 @@ def git_clone_or_update(stdscr, log: LogBuffer, state: SetupState, script_path: 
 
 
 # -------------------------
-# Build + config
+# pnpm/corepack bootstrap (non-interactive)
 # -------------------------
 
-def ensure_pnpm_for_build(stdscr, log: LogBuffer, state: SetupState) -> None:
+def ensure_pnpm_for_build(stdscr, log: LogBuffer, state: SetupState, env: Dict[str, str]) -> None:
     if which("pnpm"):
         return
     if not which("corepack"):
         raise RuntimeError("pnpm not found and corepack not available. Install pnpm and retry.")
-    run_cmd_live(stdscr, log, ["corepack", "enable"], cwd=state.clone_dir, title="corepack enable")
-    run_cmd_live(stdscr, log, ["corepack", "prepare", "pnpm@latest", "--activate"], cwd=state.clone_dir, title="corepack prepare pnpm@latest --activate")
+
+    env2 = dict(env)
+    env2["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"
+
+    run_cmd_live(stdscr, log, ["corepack", "enable"], cwd=state.clone_dir, env=env2, title="corepack enable")
+    run_cmd_live(stdscr, log, ["corepack", "prepare", "pnpm@latest", "--activate"], cwd=state.clone_dir, env=env2, title="corepack prepare pnpm@latest --activate")
+
     if not which("pnpm"):
         raise RuntimeError("pnpm still not found after corepack activation. Install pnpm manually.")
 
+
+# -------------------------
+# Build + Config
+# -------------------------
+
 def build_openclaw(stdscr, log: LogBuffer, state: SetupState, env: Dict[str, str]) -> None:
-    ensure_pnpm_for_build(stdscr, log, state)
-    run_cmd_live(stdscr, log, ["pnpm", "install"], cwd=state.clone_dir, env=env, title="pnpm install")
-    run_cmd_live(stdscr, log, ["pnpm", "ui:build"], cwd=state.clone_dir, env=env, title="pnpm ui:build")
-    run_cmd_live(stdscr, log, ["pnpm", "build"], cwd=state.clone_dir, env=env, title="pnpm build")
+    ensure_pnpm_for_build(stdscr, log, state, env)
+
+    env2 = dict(env)
+    env2["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"
+
+    run_cmd_live(stdscr, log, ["pnpm", "install"], cwd=state.clone_dir, env=env2, title="pnpm install")
+    run_cmd_live(stdscr, log, ["pnpm", "ui:build"], cwd=state.clone_dir, env=env2, title="pnpm ui:build")
+    run_cmd_live(stdscr, log, ["pnpm", "build"], cwd=state.clone_dir, env=env2, title="pnpm build")
 
 def maybe_pull_ollama_model(stdscr, log: LogBuffer, state: SetupState) -> None:
     if state.pull_model and state.ollama_model:
@@ -764,17 +792,35 @@ def write_openclaw_files(state: SetupState) -> None:
     safe_mkdir(state.state_dir)
     safe_mkdir(state.workspace_dir)
 
-    update_dotenv(state.dotenv_path, {"OLLAMA_API_KEY": "ollama-local"})
+    # This is convenience; you can "source" it for your shell session.
+    update_dotenv(
+        state.dotenv_path,
+        {
+            "OLLAMA_API_KEY": "ollama-local",
+            "OLLAMA_BASE_URL": state.ollama_base,
+            "OPENCLAW_GATEWAY_TOKEN": state.gateway_token,
+            "OPENCLAW_CONFIG_PATH": str(state.config_path),
+        },
+    )
 
-    cfg: dict = {
+    base_cfg = read_json_if_exists(state.config_path) or {}
+
+    desired: dict = {
+        "gateway": {
+            "mode": "local",
+            "auth": {"token": state.gateway_token},
+        },
         "agents": {
             "defaults": {"model": {"primary": f"ollama/{state.ollama_model}"}},
             "list": [{"id": "main", "default": True, "workspace": str(state.workspace_dir)}],
-        }
+        },
     }
 
+    if state.behind_proxy and state.trusted_proxies:
+        desired.setdefault("gateway", {})["trustedProxies"] = state.trusted_proxies
+
     if state.telegram_enabled and state.telegram_accounts:
-        cfg["channels"] = {
+        desired["channels"] = {
             "telegram": {
                 "enabled": True,
                 "dmPolicy": state.telegram_dm_policy,
@@ -782,15 +828,18 @@ def write_openclaw_files(state: SetupState) -> None:
             }
         }
 
-    write_json_config(state.config_path, cfg)
+    deep_merge(base_cfg, desired)
+    write_json_config(state.config_path, base_cfg)
 
 def run_postcheck(stdscr, log: LogBuffer, state: SetupState, env: Dict[str, str]) -> None:
+    env2 = dict(env)
+    env2["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"
     run_cmd_live(
         stdscr,
         log,
         ["pnpm", "openclaw", "models", "list"],
         cwd=state.clone_dir,
-        env=env,
+        env=env2,
         title="Post-check: pnpm openclaw models list",
     )
 
@@ -815,7 +864,7 @@ def pick_telegram(stdscr, state: SetupState) -> None:
         stdscr,
         "Telegram setup",
         "Do you want to configure Telegram bot(s) now?\n\nIf yes, you'll enter one or more bot tokens.",
-        default_yes=True,
+        default_yes=False,
     )
     if not state.telegram_enabled:
         state.telegram_accounts = {}
@@ -886,108 +935,203 @@ def pick_ollama_model(stdscr, state: SetupState) -> None:
     state.ollama_model = chosen
     state.pull_model = yes_no(stdscr, "Ollama pull", f"Run `ollama pull {chosen}` now?", default_yes=True)
 
-def pick_gateway_port_if_needed(stdscr, state: SetupState) -> None:
-    if not state.start_gateway:
-        return
-    while True:
-        p = prompt_text(stdscr, "Gateway port", "Enter the port to run the OpenClaw gateway on:", initial=str(state.gateway_port))
-        if p is None:
-            state.start_gateway = False
-            return
-        try:
-            port = int(p.strip())
-            if not (1 <= port <= 65535):
-                raise ValueError
-        except ValueError:
-            message_box(stdscr, "Invalid port", "Please enter a number between 1 and 65535.")
-            continue
+def show_token_howto(stdscr, state: SetupState) -> None:
+    tok = state.gateway_token
+    port = state.gateway_port
+    local_url = f"http://127.0.0.1:{port}/?token={quote(tok)}"
+    msg = (
+        "This is your Gateway token (admin credential for Dashboard/Control UI + API).\n"
+        "Do not share it.\n\n"
+        f"Token:\n{tok}\n\n"
+        "Where to use it:\n\n"
+        "1) Start gateway (known-good):\n"
+        f"   pnpm openclaw gateway --port {port} --verbose --allow-unconfigured --token \"{tok}\"\n\n"
+        "2) Dashboard / Control UI:\n"
+        f"   Open: {local_url}\n"
+        "   Or paste token into Control UI settings.\n\n"
+        "3) curl / HTTP calls:\n"
+        f"   curl -H 'Authorization: Bearer {tok}' http://127.0.0.1:{port}/v1/models\n"
+    )
+    if state.public_dashboard_url:
+        pub_url = f"{state.public_dashboard_url}/?token={quote(tok)}"
+        msg += f"\nPublic/tunnel URL (if applicable):\n{pub_url}\n"
+    message_box(stdscr, "Gateway token + usage", msg, footer="Press any key")
 
-        if not port_is_free("127.0.0.1", port):
-            message_box(stdscr, "Port in use", f"Port {port} appears to be in use on 127.0.0.1.\n\nPick a different port.")
-            continue
+def pick_gateway_settings(stdscr, state: SetupState) -> None:
+    state.start_gateway = yes_no(
+        stdscr,
+        "Gateway",
+        "Start the OpenClaw gateway after setup?\n\nIf yes, it will run in this terminal until you press 'q'.",
+        default_yes=True,
+    )
 
-        state.gateway_port = port
+    p = prompt_text(stdscr, "Gateway port", "Port for the gateway:", initial=str(state.gateway_port))
+    if p is None:
+        raise SystemExit(0)
+    try:
+        port = int(p.strip())
+        if not (1 <= port <= 65535):
+            raise ValueError
+    except ValueError:
+        port = state.gateway_port
+
+    if not port_is_free("127.0.0.1", port):
+        use_anyway = yes_no(stdscr, "Port in use", f"Port {port} appears to be in use.\n\nUse it anyway?", default_yes=False)
+        if not use_anyway:
+            message_box(stdscr, "Tip", "Pick a different port and re-run this script, or free the port first.")
+    state.gateway_port = port
+
+    default_token = "dev-" + secrets.token_urlsafe(18)
+    t = prompt_text(
+        stdscr,
+        "Gateway token",
+        "Gateway requires a token.\n\n"
+        "This will be written to:\n"
+        "- ~/.openclaw/openclaw.json (gateway.auth.token)\n"
+        "- ~/.openclaw/.env (OPENCLAW_GATEWAY_TOKEN)\n\n"
+        "Choose a token:",
+        initial=default_token,
+        secret=False,
+    )
+    if not t:
+        raise SystemExit(0)
+    state.gateway_token = t.strip()
+
+def pick_proxy_settings(stdscr, state: SetupState) -> None:
+    state.behind_proxy = yes_no(
+        stdscr,
+        "Reverse proxy / Tunnel",
+        "Are you accessing the dashboard through a reverse proxy or tunnel?\n\n"
+        "Examples:\n"
+        "- Cloudflare Tunnel (trycloudflare.com)\n"
+        "- nginx/caddy/traefik on the same host\n\n"
+        "If yes, we'll set gateway.trustedProxies so OpenClaw can trust X-Forwarded-* headers\n"
+        "and avoid the 'Proxy headers detected from untrusted address' warnings.",
+        default_yes=False,
+    )
+
+    if not state.behind_proxy:
+        state.trusted_proxies = []
+        state.public_dashboard_url = ""
         return
+
+    # Minimal safe defaults: trust only loopback (common for cloudflared/nginx on same host)
+    default_list = ["127.0.0.1/32", "::1/128"]
+    state.trusted_proxies = default_list
+
+    extra = prompt_text(
+        stdscr,
+        "Trusted proxies",
+        "Trusted proxy CIDRs/IPs (comma-separated).\n\n"
+        "Defaults are loopback only (recommended).\n"
+        "Only add the IP/CIDR of the proxy process that connects to OpenClaw.\n\n"
+        "Leave blank to keep defaults:",
+        initial="",
+    )
+    if extra:
+        parts = [p.strip() for p in extra.split(",") if p.strip()]
+        cleaned: List[str] = []
+        for p in parts:
+            if re.match(r"^[0-9a-fA-F:.]+(?:/\d{1,3})?$", p):
+                cleaned.append(p)
+        # preserve order, remove dups
+        merged = []
+        for x in default_list + cleaned:
+            if x not in merged:
+                merged.append(x)
+        state.trusted_proxies = merged
+
+    pub = prompt_text(
+        stdscr,
+        "Public dashboard URL (optional)",
+        "If you have a public URL (e.g. https://xxxxx.trycloudflare.com), paste it here.\n"
+        "We’ll show the tokenized URL for convenience.\n\n"
+        "Leave blank if you only use localhost:",
+        initial="",
+    )
+    state.public_dashboard_url = (pub or "").strip().rstrip("/")
 
 def final_confirm(stdscr, state: SetupState) -> None:
-    summary = []
-    summary.append(f"Clone dir:  {state.clone_dir}")
-    summary.append(f"Config:     {state.config_path}")
-    summary.append(f".env:       {state.dotenv_path}")
-    summary.append(f"Workspace:  {state.workspace_dir}")
-    summary.append(f"Ollama:     {state.ollama_base}")
-    summary.append(f"Model:      {state.ollama_model} (pull={state.pull_model})")
-    if state.telegram_enabled:
-        summary.append(f"Telegram:   enabled (dmPolicy={state.telegram_dm_policy}) accounts={', '.join(sorted(state.telegram_accounts.keys()))}")
-    else:
-        summary.append("Telegram:   skipped")
-    summary.append("")
-    summary.append("Proceed with clone/build/config write?")
-
-    ok = yes_no(stdscr, "Confirm", "\n".join(summary), default_yes=True)
+    summary = [
+        f"Clone dir:   {state.clone_dir}",
+        f"Config:      {state.config_path}",
+        f".env:        {state.dotenv_path}",
+        f"Workspace:   {state.workspace_dir}",
+        f"Ollama:      {state.ollama_base}",
+        f"Model:       {state.ollama_model} (pull={state.pull_model})",
+        f"Gateway:     port={state.gateway_port} start={state.start_gateway}",
+        f"Token:       {'set' if state.gateway_token else 'MISSING'}",
+        f"Proxy/Tunnel:{'yes' if state.behind_proxy else 'no'}",
+        f"Telegram:    {'enabled' if state.telegram_enabled else 'skipped'}",
+    ]
+    ok = yes_no(stdscr, "Confirm", "\n".join(summary) + "\n\nProceed with clone/build/config?", default_yes=True)
     if not ok:
         raise SystemExit(0)
 
-    state.start_gateway = yes_no(
-        stdscr,
-        "Start gateway",
-        "After setup finishes, do you want to start the OpenClaw gateway now?\n\n"
-        "If yes, it will run in this terminal until you press 'q'.",
-        default_yes=False,
-    )
+
+# -------------------------
+# Gateway start + tests
+# -------------------------
+
+def build_env(state: SetupState) -> Dict[str, str]:
+    return {
+        "SHARP_IGNORE_GLOBAL_LIBVIPS": "1",
+        "OPENCLAW_CONFIG_PATH": str(state.config_path),
+        "OLLAMA_API_KEY": "ollama-local",
+        "OLLAMA_BASE_URL": state.ollama_base,
+        "OPENCLAW_GATEWAY_TOKEN": state.gateway_token,
+        "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+    }
 
 def maybe_start_gateway(stdscr, log: LogBuffer, state: SetupState, env: Dict[str, str]) -> None:
     if not state.start_gateway:
         return
 
-    cmd = ["pnpm", "openclaw", "gateway", "--port", str(state.gateway_port), "--verbose"]
+    # Avoid buffered 'q' from previous screens killing gateway instantly.
     try:
-        rc = run_cmd_live(
-            stdscr,
-            log,
-            cmd,
-            cwd=state.clone_dir,
-            env=env,
-            title=f"Gateway running on port {state.gateway_port} (press q to stop)",
-            check=False,
-            abort_is_error=False,
-        )
-        if rc not in (0, 130):
-            message_box(
-                stdscr,
-                "Gateway exited",
-                "The gateway exited with a non-zero status.\n\n"
-                "Last output:\n\n"
-                f"{log.tail(60)}\n\n"
-                "Try starting it manually to see full error output:\n"
-                f"  cd {state.clone_dir}\n"
-                f"  {' '.join(cmd)}\n",
-                footer="Press any key to continue",
-            )
-    except Exception as e:
+        curses.flushinp()
+    except Exception:
+        pass
+
+    cmd = [
+        "pnpm", "openclaw", "gateway",
+        "--port", str(state.gateway_port),
+        "--verbose",
+        "--allow-unconfigured",
+        "--token", state.gateway_token,
+    ]
+
+    env2 = dict(env)
+    env2["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"
+
+    rc = run_cmd_live(
+        stdscr,
+        log,
+        cmd,
+        cwd=state.clone_dir,
+        env=env2,
+        title=f"Gateway running on port {state.gateway_port} (press q to stop)",
+        check=False,
+        abort_is_error=False,  # stopping gateway is normal
+    )
+
+    if rc not in (0, 130):
         message_box(
             stdscr,
-            "Gateway failed to start",
-            f"{e}\n\nLast output:\n\n{log.tail(60)}\n\n"
-            "Try starting it manually:\n"
-            f"  cd {state.clone_dir}\n"
-            f"  {' '.join(cmd)}\n",
+            "Gateway exited",
+            "Gateway exited with a non-zero status.\n\nLast output:\n\n"
+            f"{log.tail(60)}",
             footer="Press any key to continue",
         )
 
 
 # -------------------------
-# Run all steps
+# Orchestration
 # -------------------------
 
 def run_all_steps(stdscr, state: SetupState, script_path: Path, start_cwd: Path) -> None:
     log = LogBuffer()
-
-    env = {
-        "SHARP_IGNORE_GLOBAL_LIBVIPS": "1",
-        "OPENCLAW_CONFIG_PATH": str(state.config_path),
-        "OLLAMA_API_KEY": "ollama-local",
-    }
+    env = build_env(state)
 
     try:
         git_clone_or_update(stdscr, log, state, script_path=script_path, start_cwd=start_cwd)
@@ -1008,20 +1152,40 @@ def run_all_steps(stdscr, state: SetupState, script_path: Path, start_cwd: Path)
         message_box(stdscr, "Setup failed", f"{e}\n\nLast output:\n\n{log.tail(80)}", footer="Press any key to exit")
         raise SystemExit(1)
 
-    message_box(
-        stdscr,
-        "Done",
+    tok = state.gateway_token
+    port = state.gateway_port
+    local_url = f"http://127.0.0.1:{port}/?token={quote(tok)}"
+    pub_url = f"{state.public_dashboard_url}/?token={quote(tok)}" if state.public_dashboard_url else ""
+
+    done_msg = (
         "Setup complete.\n\n"
-        "Next steps:\n"
-        f"1) (Optional) Start the gateway:\n"
-        f"   cd {state.clone_dir}\n"
-        f"   pnpm openclaw gateway --port {state.gateway_port} --verbose\n\n"
-        "2) Confirm models:\n"
-        "   pnpm openclaw models list\n\n"
-        f"Config written to:\n  {state.config_path}\n"
-        f"Env written to:\n  {state.dotenv_path}\n",
-        footer="Press any key to exit",
+        "KEY YOU NEED (Gateway token):\n"
+        f"{tok}\n\n"
+        "Where to pass it:\n\n"
+        "A) Start gateway:\n"
+        f"cd {state.clone_dir}\n"
+        f"export OPENCLAW_CONFIG_PATH=\"$HOME/.openclaw/openclaw.json\"\n"
+        f"export OLLAMA_API_KEY=\"ollama-local\"\n"
+        f"pnpm openclaw gateway --port {port} --verbose --allow-unconfigured --token \"{tok}\"\n\n"
+        "B) Control UI / Dashboard:\n"
+        f"- Local:  {local_url}\n"
+        + (f"- Public: {pub_url}\n" if pub_url else "")
+        + "  (Or paste token into Control UI settings.)\n\n"
+        "C) curl tests (token required):\n"
+        f"curl -sv -H 'Authorization: Bearer {tok}' http://127.0.0.1:{port}/ 2>&1 | head -n 30\n\n"
+        "Probe common endpoints:\n"
+        "for p in / /health /healthz /ready /readyz /status /version /api/health /api/status /v1/models; do\n"
+        "  echo \"== $p\";\n"
+        f"  curl -sS -o /dev/null -w \"%{{http_code}}\\n\" -H \"Authorization: Bearer {tok}\" \"http://127.0.0.1:{port}$p\" || true;\n"
+        "done\n\n"
+        "Ollama quick checks:\n"
+        f"curl -s {state.ollama_base}/api/tags | head\n"
+        "ollama list\n\n"
+        f"Config: {state.config_path}\n"
+        f"Env:    {state.dotenv_path}\n"
     )
+
+    message_box(stdscr, "Done", done_msg, footer="Press any key to exit")
 
 
 # -------------------------
@@ -1040,15 +1204,12 @@ def main_curses(stdscr) -> None:
 
     message_box(
         stdscr,
-        "OpenClaw + Ollama setup wizard",
-        "This wizard will clone and build OpenClaw from source, configure Ollama (implicit discovery),\n"
-        "and optionally configure Telegram bot tokens.\n\n"
-        "Controls:\n"
-        "- Lists: arrow keys + Enter\n"
-        "- Type to filter lists\n"
-        "- Esc cancels screens\n"
-        "- During long-running commands, press 'q' to abort\n"
-        "  (Stopping the gateway with 'q' is normal.)",
+        "OpenClaw + Ollama bootstrap wizard",
+        "This wizard will clone/build OpenClaw, set Ollama as the primary model provider,\n"
+        "configure gateway mode + token (the key you must use in Control UI + curl),\n"
+        "optionally configure trusted proxies for Cloudflare/nginx, optionally configure Telegram,\n"
+        "and optionally start the gateway.\n\n"
+        "During long steps: press 'q' to abort (gateway: 'q' stops it normally).",
         footer="Press any key to begin",
     )
 
@@ -1056,15 +1217,19 @@ def main_curses(stdscr) -> None:
     pick_clone_dir(stdscr, state)
     pick_telegram(stdscr, state)
     pick_ollama_model(stdscr, state)
+    pick_gateway_settings(stdscr, state)
+    pick_proxy_settings(stdscr, state)
+
+    # Now that we have token + (maybe) public URL, show the “how to use the key” screen.
+    show_token_howto(stdscr, state)
+
     final_confirm(stdscr, state)
-    pick_gateway_port_if_needed(stdscr, state)
     run_all_steps(stdscr, state, script_path=script_path, start_cwd=start_cwd)
 
 def main() -> None:
-    if sys.platform.startswith("win"):
-        if "WSL_DISTRO_NAME" not in os.environ and "TERM" not in os.environ:
-            print("This curses wizard expects a proper terminal. On Windows, run it in WSL2.")
-            return
+    if sys.platform.startswith("win") and "WSL_DISTRO_NAME" not in os.environ:
+        print("This curses wizard expects a proper terminal. On Windows, run it in WSL2.")
+        return
     curses.wrapper(main_curses)
 
 if __name__ == "__main__":
